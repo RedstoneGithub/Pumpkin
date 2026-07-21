@@ -313,7 +313,8 @@ impl EntityBase for ArrowEntity {
             }
 
             // Entity collisions
-            let candidates = world.get_entities_at_box(&search_box);
+            // Projectiles can strike both normal entities and players.
+            let candidates = world.get_all_at_box(&search_box);
             for cand in candidates {
                 if self.should_skip_collision(entity, &cand) {
                     continue;
@@ -408,20 +409,24 @@ impl EntityBase for ArrowEntity {
                         target.get_entity().set_on_fire_for_ticks(100);
                     }
 
-                    target
-                        .damage(&*target, damage as f32, DamageType::ARROW)
+                    let damaged = target
+                        .damage_with_context(
+                            target.as_ref(),
+                            damage as f32,
+                            DamageType::ARROW,
+                            Some(hit_pos),
+                            Some(self),
+                            None,
+                        )
                         .await;
 
-                    if target.get_living_entity().is_some() {
+                    if damaged && target.get_living_entity().is_some() {
                         let punch = self.punch_level.load(Ordering::Relaxed);
-                        if punch > 0
-                            && let Some(owner_id) = self.owner_id
-                            && let Some(owner_entity) = world.get_entity_by_id(owner_id)
-                        {
-                            crate::entity::combat::handle_knockback(
-                                owner_entity.get_entity(),
-                                target.get_entity(),
+                        if punch > 0 {
+                            crate::entity::combat::handle_projectile_knockback(
+                                target.as_ref(),
                                 f64::from(punch) * 0.6,
+                                velocity,
                             );
                         }
 

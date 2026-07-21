@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 
 use crate::entity::EntityBase;
 use pumpkin_data::{
+    attributes::Attributes,
     particle::Particle,
     sound::{Sound, SoundCategory},
 };
@@ -61,16 +62,57 @@ impl AttackType {
     }
 }
 
-pub fn handle_knockback(attacker: &Entity, victim: &Entity, strength: f64) {
+fn apply_knockback_from_source(
+    victim: &dyn EntityBase,
+    strength: f64,
+    source_x: f64,
+    source_z: f64,
+) {
+    // `LivingEntity#knockback` applies this attribute before delegating to
+    // `Entity#knockback`.  Callers used to pass the bare Entity here, which
+    // bypassed the resistance entirely.
+    let resistance = victim.get_living_entity().map_or(0.0, |living| {
+        living
+            .get_attribute_value(&Attributes::KNOCKBACK_RESISTANCE)
+            .clamp(0.0, 1.0)
+    });
+    let strength = strength * (1.0 - resistance);
+    if strength <= 0.0 {
+        return;
+    }
+
+    let victim_entity = victim.get_entity();
+    victim_entity.apply_knockback(strength * 0.5, source_x, source_z);
+    victim_entity.send_velocity();
+}
+
+pub fn handle_knockback(attacker: &Entity, victim: &dyn EntityBase, strength: f64) {
     let yaw = attacker.yaw.load();
-    victim.knockback(
-        strength * 0.5,
+    apply_knockback_from_source(
+        victim,
+        strength,
         f64::from((yaw.to_radians()).sin()),
         f64::from(-(yaw.to_radians()).cos()),
     );
 
     let velocity = attacker.velocity.load();
     attacker.velocity.store(velocity.multiply(0.6, 1.0, 0.6));
+}
+
+/// Applies projectile knockback along its flight direction.
+pub fn handle_projectile_knockback(
+    victim: &dyn EntityBase,
+    strength: f64,
+    projectile_velocity: Vector3<f64>,
+) {
+    // `apply_knockback` expects a vector from the victim toward the source;
+    // the projectile travels in the opposite direction.
+    apply_knockback_from_source(
+        victim,
+        strength,
+        -projectile_velocity.x,
+        -projectile_velocity.z,
+    );
 }
 
 pub fn spawn_sweep_particle(attacker_entity: &Entity, world: &World, pos: &Vector3<f64>) {

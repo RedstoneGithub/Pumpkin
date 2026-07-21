@@ -1038,7 +1038,7 @@ impl Player {
                 } else {
                     DamageType::PLAYER_ATTACK
                 },
-                None,
+                Some(attacker_entity.pos.load()),
                 Some(self),
                 Some(self),
             )
@@ -1097,7 +1097,13 @@ impl Player {
         );
 
         if victim.get_living_entity().is_some() {
-            let mut knockback_strength = 1.0 + f64::from(knockback_level);
+            // Vanilla starts at the attack-knockback attribute (0.0 for a
+            // normal player), then adds Knockback levels and the sprint hit.
+            // Starting at 1.0 gave every ordinary hit a sprint-strength push.
+            let mut knockback_strength = self
+                .living_entity
+                .get_attribute_value(&Attributes::ATTACK_KNOCKBACK)
+                + f64::from(knockback_level);
             match attack_type {
                 AttackType::Knockback => knockback_strength += 1.0,
                 AttackType::Sweeping => {
@@ -1141,8 +1147,8 @@ impl Player {
                 }
                 _ => {}
             }
-            if config.knockback {
-                combat::handle_knockback(attacker_entity, victim_entity, knockback_strength);
+            if config.knockback && knockback_strength > 0.0 {
+                combat::handle_knockback(attacker_entity, victim.as_ref(), knockback_strength);
             }
         }
 

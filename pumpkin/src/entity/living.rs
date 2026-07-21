@@ -43,7 +43,7 @@ use pumpkin_data::data_component_impl::{
     EquipmentSlot, EquippableImpl, FoodImpl,
 };
 use pumpkin_data::effect::StatusEffect;
-use pumpkin_data::entity::{EntityPose, EntityStatus, EntityType};
+use pumpkin_data::entity::{EntityPose, EntityStatus, EntityType, MobCategory};
 use pumpkin_data::item_stack::{DamageResult, ItemStack};
 use pumpkin_data::sound::SoundCategory;
 use pumpkin_data::{Block, Enchantment, translation};
@@ -133,7 +133,19 @@ impl LivingEntity {
     ];
 
     fn hurt_sound_for_entity(entity_type: &'static EntityType) -> Sound {
-        entity_type.hurt_sound.unwrap_or(Sound::EntityGenericHurt)
+        entity_type.hurt_sound.unwrap_or_else(|| {
+            if entity_type == &EntityType::COW {
+                Sound::EntityCowHurt
+            } else if entity_type == &EntityType::SHEEP {
+                Sound::EntitySheepHurt
+            } else if entity_type == &EntityType::PIG {
+                Sound::EntityPigHurt
+            } else if entity_type == &EntityType::CHICKEN {
+                Sound::EntityChickenHurt
+            } else {
+                Sound::EntityGenericHurt
+            }
+        })
     }
 
     pub fn new(entity: Entity) -> Self {
@@ -1955,6 +1967,16 @@ impl LivingEntity {
             Self::hurt_sound_for_entity(self.entity.entity_type)
         }
     }
+
+    fn sound_category(&self) -> SoundCategory {
+        if self.entity.entity_type == &EntityType::PLAYER {
+            SoundCategory::Players
+        } else if self.entity.entity_type.category.id == MobCategory::MONSTER.id {
+            SoundCategory::Hostile
+        } else {
+            SoundCategory::Neutral
+        }
+    }
 }
 
 impl NBTStorage for LivingEntity {
@@ -2194,6 +2216,7 @@ impl EntityBase for LivingEntity {
                     self.get_effect(&StatusEffect::RESISTANCE)
                         .await
                         .map_or(0.0, |e| 0.2 * (e.amplifier + 1) as f32)
+                        .clamp(0.0, 1.0)
                 } else {
                     0.0
                 };
@@ -2375,16 +2398,24 @@ impl EntityBase for LivingEntity {
             if play_sound {
                 world.play_sound(
                     self.hurt_sound(),
-                    SoundCategory::Players,
+                    self.sound_category(),
                     &self.entity.pos.load(),
                 );
 
                 if let Some(source) = source {
-                    let source_pos = source.get_entity().pos.load();
+                    let source_pos = position.unwrap_or_else(|| source.get_entity().pos.load());
                     let target_pos = self.entity.pos.load();
                     let dx = source_pos.x - target_pos.x;
                     let dz = source_pos.z - target_pos.z;
-                    self.entity.apply_knockback(0.4, dx, dz);
+                    // Vanilla's standard hurt knockback is 0.4, reduced by
+                    // the victim's knockback-resistance attribute before the
+                    // velocity is applied.
+                    let strength = 0.4
+                        * (1.0
+                            - self
+                                .get_attribute_value(&Attributes::KNOCKBACK_RESISTANCE)
+                                .clamp(0.0, 1.0));
+                    self.entity.apply_knockback(strength, dx, dz);
                     self.entity.send_velocity();
                 }
             }
@@ -2943,6 +2974,18 @@ mod tests {
         ];
 
         for (entity_type, expected) in cases {
+            assert_eq!(LivingEntity::hurt_sound_for_entity(entity_type), expected);
+        }
+    }
+
+    #[test]
+    fn hurt_sound_for_entity_uses_farm_animal_sounds() {
+        for (entity_type, expected) in [
+            (&EntityType::COW, Sound::EntityCowHurt),
+            (&EntityType::SHEEP, Sound::EntitySheepHurt),
+            (&EntityType::PIG, Sound::EntityPigHurt),
+            (&EntityType::CHICKEN, Sound::EntityChickenHurt),
+        ] {
             assert_eq!(LivingEntity::hurt_sound_for_entity(entity_type), expected);
         }
     }

@@ -60,9 +60,12 @@ impl ClientPacket for CSoundEffect {
             w.write_option(&e.range, |w2, r| w2.write_f32_be(*r))
         })?;
         write.write_var_int(&self.sound_category)?;
-        write.write_i32_be(self.position.x * 8)?;
-        write.write_i32_be(self.position.y * 8)?;
-        write.write_i32_be(self.position.z * 8)?;
+        // `new` already converts block coordinates to the protocol's fixed
+        // point (1/8 block) representation. Scaling here again placed every
+        // sound 64 times farther from its source.
+        write.write_i32_be(self.position.x)?;
+        write.write_i32_be(self.position.y)?;
+        write.write_i32_be(self.position.z)?;
         write.write_f32_be(self.volume)?;
         write.write_f32_be(self.pitch)?;
         write.write_i64_be(self.seed as i64)

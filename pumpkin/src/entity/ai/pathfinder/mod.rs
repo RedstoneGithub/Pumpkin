@@ -64,6 +64,8 @@ pub struct Navigator {
     /// Thread-safe status check to avoid deadlocks when components (like `LookControl`) need to
     /// check navigation status.
     pub is_idle: AtomicBool,
+    /// Temporarily hold the current route without treating it as completed.
+    paused: bool,
 }
 
 impl Default for Navigator {
@@ -83,6 +85,7 @@ impl Default for Navigator {
             open_set: BinaryHeap::new(),
             neighbors_buf: Vec::new(),
             is_idle: AtomicBool::new(true),
+            paused: false,
         }
     }
 }
@@ -96,12 +99,42 @@ const TARGET_DISTANCE_MULTIPLIER: f32 = 1.5;
 const NODE_REACH_XZ: f64 = 0.5;
 const NODE_REACH_Y: f64 = 1.0;
 const MAX_YAW_TURN_PER_TICK: f32 = 90.0;
+const DESTINATION_CHANGE_DISTANCE_SQ: f64 = 1.0;
+
+/// Squared distance in the ground-navigation plane.
+///
+/// A target jumping, falling, or being knocked upward does not make its
+/// existing horizontal route obsolete.  Ground goals use this when deciding
+/// whether to replace a path; the vertical component is still used when the
+/// pathfinder builds a new route.
+#[must_use]
+pub(crate) fn horizontal_distance_squared(a: Vector3<f64>, b: Vector3<f64>) -> f64 {
+    let dx = a.x - b.x;
+    let dz = a.z - b.z;
+    dx * dx + dz * dz
+}
 
 impl Navigator {
     pub fn set_progress(&mut self, goal: NavigatorGoal) {
         self.is_idle.store(false, Ordering::Relaxed);
+
+        // Following goals update their destination regularly as a target moves.
+        // Do not discard a valid path for every such update: that makes the mob
+        // repeatedly solve A* from its current position and prevents it from
+        // making useful progress along the route it already has.
+        let destination_changed = self.current_goal.as_ref().is_none_or(|current_goal| {
+            horizontal_distance_squared(current_goal.destination, goal.destination)
+                > DESTINATION_CHANGE_DISTANCE_SQ
+        });
+
+        if destination_changed {
+            self.current_path = None;
+            self.repath_cooldown = 0;
+            self.ticks_on_current_node = 0;
+            self.last_node_index = 0;
+        }
+
         self.current_goal = Some(goal);
-        self.current_path = None;
     }
 
     pub const fn set_speed(&mut self, speed: f64) {
@@ -112,11 +145,22 @@ impl Navigator {
 
     pub fn stop(&mut self) {
         self.is_idle.store(true, Ordering::Relaxed);
+        self.paused = false;
         self.current_goal = None;
         self.current_path = None;
         self.ticks_on_current_node = 0;
         self.total_ticks = 0;
         self.path_start_pos = None;
+    }
+
+    /// Holds the current path in place. Unlike [`Self::stop`], this keeps the
+    /// navigator active so an owning goal is not terminated as if it arrived.
+    pub const fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    pub const fn resume(&mut self) {
+        self.paused = false;
     }
 
     pub fn set_pathfinding_malus(&mut self, path_type: PathType, malus: f32) {
@@ -139,7 +183,15 @@ impl Navigator {
         let mob_position = Vector3::new(start_block_vec.x, start_block_vec.y, start_block_vec.z);
 
         let context = PathfindingContext::new(mob_position, entity.entity.world.load_full());
-        let mut mob_data = MobData::new(start_pos_f, self.mob_width, self.mob_height, 1.0);
+        let max_step_height = entity.get_attribute_value(&Attributes::STEP_HEIGHT) as f32;
+        let mut mob_data = MobData::new(
+            start_pos_f,
+            self.mob_width,
+            self.mob_height,
+            max_step_height,
+        );
+        mob_data.max_fall_distance =
+            entity.get_attribute_value(&Attributes::SAFE_FALL_DISTANCE) as f32;
         mob_data.on_ground = entity.entity.on_ground.load(Ordering::Relaxed);
         mob_data.set_pathfinding_malus(PathType::DangerFire, 16.0);
         mob_data.set_pathfinding_malus(PathType::DamageFire, -1.0);
@@ -283,7 +335,7 @@ impl Navigator {
 
     fn needs_new_path(&self, goal: &NavigatorGoal) -> bool {
         if self.current_path.is_none() {
-            return true;
+            return self.repath_cooldown == 0;
         }
         if self.repath_cooldown > 0 {
             return false;
@@ -292,9 +344,8 @@ impl Navigator {
             let path_target = p.get_target();
             let goal_target = goal.destination.to_i32();
             let dx = f64::from(path_target.x - goal_target.x);
-            let dy = f64::from(path_target.y - goal_target.y);
             let dz = f64::from(path_target.z - goal_target.z);
-            let distance_sq = dx * dx + dy * dy + dz * dz;
+            let distance_sq = dx * dx + dz * dz;
             // Adaptive threshold based on remaining distance
             let remaining = p.get_remaining_distance().clamp(4.0, 16.0);
             let threshold = remaining * 0.5;
@@ -310,6 +361,12 @@ impl Navigator {
             entity.movement_input.store(Vector3::new(0.0, 0.0, 0.0));
             return;
         };
+
+        if self.paused {
+            entity.movement_input.store(Vector3::new(0.0, 0.0, 0.0));
+            self.current_goal = Some(goal);
+            return;
+        }
 
         if goal.current_progress == goal.destination {
             self.is_idle.store(true, Ordering::Relaxed);
@@ -340,6 +397,25 @@ impl Navigator {
         if let Some(path) = &mut self.current_path {
             if path.is_done() || !path.is_valid() {
                 entity.movement_input.store(Vector3::new(0.0, 0.0, 0.0));
+                if path.is_done() {
+                    // A partial path ends at the best reachable node. Continue
+                    // toward the original destination by finding a fresh route
+                    // from there instead of treating it as an arrival.
+                    if !path.can_reach() {
+                        self.current_path = None;
+                        self.repath_cooldown = 0;
+                        self.current_goal = Some(goal);
+                        return;
+                    }
+
+                    self.is_idle.store(true, Ordering::Relaxed);
+                    self.current_path = None;
+                    return;
+                }
+
+                // An invalid path can become usable as the world changes, so
+                // retain the destination and retry on the next navigation tick.
+                self.current_path = None;
                 self.current_goal = Some(goal);
                 return;
             }
@@ -394,15 +470,17 @@ impl Navigator {
 
                 let horizontal_dist_sq = dx * dx + dz * dz;
                 let horizontal_dist = horizontal_dist_sq.sqrt();
+                let node_reach_xz = (f64::from(entity.entity.entity_dimension.load().width) * 0.5)
+                    .max(NODE_REACH_XZ);
 
                 // Skip node if we're above it on the same XZ column and airborne (falling toward it)
-                if !on_ground && horizontal_dist < NODE_REACH_XZ && dy < -0.5 {
+                if !on_ground && horizontal_dist < node_reach_xz && dy < -0.5 {
                     path.advance();
                     self.current_goal = Some(goal);
                     return;
                 }
 
-                if horizontal_dist < NODE_REACH_XZ && dy.abs() < NODE_REACH_Y {
+                if horizontal_dist < node_reach_xz && dy.abs() < NODE_REACH_Y {
                     path.advance();
                     self.current_goal = Some(goal);
                     return;
@@ -430,7 +508,8 @@ impl Navigator {
                 let jump_distance = 1.0f64.max(width);
 
                 // Jump when the next node is above step height and we're close enough horizontally
-                if dy > entity.get_attribute_value(&Attributes::STEP_HEIGHT)
+                if on_ground
+                    && dy > entity.get_attribute_value(&Attributes::STEP_HEIGHT)
                     && horizontal_dist_sq < jump_distance
                 {
                     entity
@@ -445,6 +524,7 @@ impl Navigator {
                 self.is_idle.store(true, Ordering::Relaxed);
                 self.current_path = None;
                 entity.movement_input.store(Vector3::new(0.0, 0.0, 0.0));
+                return;
             }
         }
 
@@ -454,5 +534,92 @@ impl Navigator {
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.is_idle.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Navigator, NavigatorGoal, horizontal_distance_squared};
+    use crate::entity::ai::pathfinder::path::Path;
+    use pumpkin_util::math::vector3::Vector3;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn keeping_a_nearby_destination_preserves_the_current_path() {
+        let mut navigator = Navigator::default();
+        let destination = Vector3::new(12.0, 64.0, -4.0);
+        navigator.current_goal = Some(NavigatorGoal::new(Vector3::default(), destination, 1.0));
+        navigator.current_path = Some(Path::empty(destination.to_i32()));
+        navigator.repath_cooldown = 12;
+
+        navigator.set_progress(NavigatorGoal::new(
+            Vector3::default(),
+            Vector3::new(12.5, 64.0, -4.0),
+            1.0,
+        ));
+
+        assert!(navigator.current_path.is_some());
+        assert_eq!(navigator.repath_cooldown, 12);
+    }
+
+    #[test]
+    fn changing_destination_restarts_pathfinding() {
+        let mut navigator = Navigator::default();
+        let destination = Vector3::new(12.0, 64.0, -4.0);
+        navigator.current_goal = Some(NavigatorGoal::new(Vector3::default(), destination, 1.0));
+        navigator.current_path = Some(Path::empty(destination.to_i32()));
+        navigator.repath_cooldown = 12;
+
+        navigator.set_progress(NavigatorGoal::new(
+            Vector3::default(),
+            Vector3::new(14.0, 64.0, -4.0),
+            1.0,
+        ));
+
+        assert!(navigator.current_path.is_none());
+        assert_eq!(navigator.repath_cooldown, 0);
+    }
+
+    #[test]
+    fn jumping_destination_preserves_the_current_path() {
+        let mut navigator = Navigator::default();
+        let destination = Vector3::new(12.0, 64.0, -4.0);
+        navigator.current_goal = Some(NavigatorGoal::new(Vector3::default(), destination, 1.0));
+        navigator.current_path = Some(Path::empty(destination.to_i32()));
+        navigator.repath_cooldown = 12;
+
+        navigator.set_progress(NavigatorGoal::new(
+            Vector3::default(),
+            Vector3::new(12.0, 65.25, -4.0),
+            1.0,
+        ));
+
+        assert!(navigator.current_path.is_some());
+        assert_eq!(navigator.repath_cooldown, 12);
+    }
+
+    #[test]
+    fn horizontal_distance_ignores_target_height() {
+        let ground = Vector3::new(12.0, 64.0, -4.0);
+        let jumping = Vector3::new(12.0, 65.25, -4.0);
+
+        assert_eq!(horizontal_distance_squared(ground, jumping), 0.0);
+    }
+
+    #[test]
+    fn pausing_navigation_does_not_mark_the_route_as_finished() {
+        let mut navigator = Navigator::default();
+        navigator.current_goal = Some(NavigatorGoal::new(
+            Vector3::default(),
+            Vector3::new(12.0, 64.0, -4.0),
+            1.0,
+        ));
+        navigator.is_idle.store(false, Ordering::Relaxed);
+
+        navigator.pause();
+
+        assert!(navigator.current_goal.is_some());
+        assert!(!navigator.is_idle());
+        assert!(navigator.paused);
     }
 }

@@ -599,6 +599,14 @@ pub trait EntityBase: Send + Sync + NBTStorage + std::any::Any {
 
     fn get_living_entity(&self) -> Option<&LivingEntity>;
 
+    /// Returns the mob state for entities that use the shared mob AI runtime.
+    ///
+    /// This keeps world-level persistence independent of every concrete mob
+    /// implementation, including the thin wrapper types used by variants.
+    fn get_mob(&self) -> Option<&mob::MobEntity> {
+        None
+    }
+
     fn cast_any(&self) -> &dyn std::any::Any;
 
     fn get_item_entity(self: Arc<Self>) -> Option<Arc<ItemEntity>> {

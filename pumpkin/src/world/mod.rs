@@ -388,6 +388,9 @@ impl World {
         let current_chunk = entity.get_entity().block_pos.load().chunk_position();
         let mut nbt = NbtCompound::new();
         entity.write_nbt(&mut nbt).await;
+        if let Some(mob) = entity.get_mob() {
+            mob.write_nbt(&mut nbt);
+        }
         let chunk = self.level.get_entity_chunk(current_chunk).await;
         chunk.data.lock().await.push(nbt);
         chunk.mark_dirty(true);
@@ -3656,6 +3659,9 @@ impl World {
                         let entity =
                             from_type(entity_type, Vector3::new(0.0, 0.0, 0.0), &world, uuid);
                         entity.read_nbt_non_mut(entity_nbt).await;
+                        if let Some(mob) = entity.get_mob() {
+                            mob.read_nbt(entity_nbt);
+                        }
                         entity.init_data_tracker().await;
 
                         let base_entity = entity.get_entity();

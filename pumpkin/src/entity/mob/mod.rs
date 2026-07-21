@@ -10,8 +10,10 @@ use crate::world::World;
 use crossbeam::atomic::AtomicCell;
 use pumpkin_data::attributes::Attributes;
 use pumpkin_data::damage::DamageType;
+use pumpkin_data::entity::EntityType;
 use pumpkin_data::item_stack::ItemStack;
 use pumpkin_data::meta_data_type::MetaDataType;
+use pumpkin_data::sound::{Sound, SoundCategory};
 use pumpkin_data::tag::{self, Taggable};
 use pumpkin_data::tracked_data::TrackedData;
 use pumpkin_protocol::java::client::play::{CHeadRot, CUpdateEntityRot, Metadata};
@@ -76,6 +78,7 @@ pub struct MobEntity {
     pub love_ticks: AtomicI32,
     pub breeding_cooldown: AtomicI32,
     pub breeder: AtomicCell<Option<Uuid>>,
+    ambient_sound_time: AtomicI32,
     mob_flags: AtomicU8,
     last_sent_yaw: AtomicU8,
     last_sent_pitch: AtomicU8,
@@ -99,11 +102,15 @@ impl MobEntity {
 
     #[must_use]
     pub fn new(entity: Entity) -> Self {
+        let dimensions = entity.entity_dimension.load();
+        let mut navigator = Navigator::default();
+        navigator.set_mob_dimensions(dimensions.width, dimensions.height);
+
         Self {
             living_entity: LivingEntity::new(entity),
             goals_selector: std::sync::Mutex::new(GoalSelector::default()),
             target_selector: std::sync::Mutex::new(GoalSelector::default()),
-            navigator: std::sync::Mutex::new(Navigator::default()),
+            navigator: std::sync::Mutex::new(navigator),
             target: tokio::sync::Mutex::new(None),
             look_control: std::sync::Mutex::new(LookControl::default()),
             move_control: std::sync::Mutex::new(Box::new(MoveControl::default())),
@@ -112,6 +119,9 @@ impl MobEntity {
             love_ticks: AtomicI32::new(0),
             breeding_cooldown: AtomicI32::new(0),
             breeder: AtomicCell::new(None),
+            // Vanilla starts below zero, then raises the chance of an idle
+            // sound each tick after the minimum delay has elapsed.
+            ambient_sound_time: AtomicI32::new(-80),
             mob_flags: AtomicU8::new(0),
             last_sent_yaw: AtomicU8::new(0),
             last_sent_pitch: AtomicU8::new(0),
@@ -155,6 +165,78 @@ impl MobEntity {
 
     pub fn is_no_ai(&self) -> bool {
         (self.mob_flags.load(Relaxed) & Self::AI_DISABLED_FLAG) != 0
+    }
+
+    fn ambient_sound(&self) -> Option<(Sound, SoundCategory)> {
+        let entity_type = self.living_entity.entity.entity_type;
+        let sound = if entity_type == &EntityType::ZOMBIE {
+            Sound::EntityZombieAmbient
+        } else if entity_type == &EntityType::HUSK {
+            Sound::EntityHuskAmbient
+        } else if entity_type == &EntityType::DROWNED {
+            Sound::EntityDrownedAmbient
+        } else if entity_type == &EntityType::ZOMBIE_VILLAGER {
+            Sound::EntityZombieVillagerAmbient
+        } else if entity_type == &EntityType::ZOMBIFIED_PIGLIN {
+            Sound::EntityZombifiedPiglinAmbient
+        } else if entity_type == &EntityType::SKELETON || entity_type == &EntityType::PARCHED {
+            Sound::EntitySkeletonAmbient
+        } else if entity_type == &EntityType::BOGGED {
+            Sound::EntityBoggedAmbient
+        } else if entity_type == &EntityType::STRAY {
+            Sound::EntityStrayAmbient
+        } else if entity_type == &EntityType::WITHER_SKELETON {
+            Sound::EntityWitherSkeletonAmbient
+        } else if entity_type == &EntityType::SPIDER || entity_type == &EntityType::CAVE_SPIDER {
+            Sound::EntitySpiderAmbient
+        } else if entity_type == &EntityType::ENDERMAN {
+            Sound::EntityEndermanAmbient
+        } else if entity_type == &EntityType::WITCH {
+            Sound::EntityWitchAmbient
+        } else if entity_type == &EntityType::COW {
+            return Some((Sound::EntityCowAmbient, SoundCategory::Neutral));
+        } else if entity_type == &EntityType::PIG {
+            return Some((Sound::EntityPigAmbient, SoundCategory::Neutral));
+        } else if entity_type == &EntityType::SHEEP {
+            return Some((Sound::EntitySheepAmbient, SoundCategory::Neutral));
+        } else if entity_type == &EntityType::CHICKEN {
+            return Some((Sound::EntityChickenAmbient, SoundCategory::Neutral));
+        } else {
+            return None;
+        };
+
+        Some((sound, SoundCategory::Hostile))
+    }
+
+    pub fn tick_ambient_sound(&self) {
+        if self.living_entity.dead.load(Relaxed) {
+            return;
+        }
+
+        let Some((sound, category)) = self.ambient_sound() else {
+            return;
+        };
+
+        let time = self.ambient_sound_time.fetch_add(1, Relaxed);
+        if time >= 0 && rand::rng().random_range(0..1000) < time {
+            self.ambient_sound_time.store(-80, Relaxed);
+            let entity = &self.living_entity.entity;
+            entity
+                .world
+                .load()
+                .play_sound(sound, category, &entity.pos.load());
+        }
+    }
+
+    /// Writes mob-wide NBT that must be preserved regardless of the concrete
+    /// mob type. Concrete entities remain responsible for their own data.
+    pub fn write_nbt(&self, nbt: &mut pumpkin_nbt::compound::NbtCompound) {
+        write_no_ai_nbt(nbt, self.is_no_ai());
+    }
+
+    /// Restores mob-wide NBT after the concrete entity has loaded its data.
+    pub fn read_nbt(&self, nbt: &pumpkin_nbt::compound::NbtCompound) {
+        self.set_no_ai(read_no_ai_nbt(nbt));
     }
 
     fn set_mob_flag(&self, flag: u8, value: bool) {
@@ -270,7 +352,7 @@ impl MobEntity {
                 target,
                 attack_damage,
                 DamageType::MOB_ATTACK,
-                None,
+                Some(caller.get_entity().pos.load()),
                 Some(caller),
                 Some(caller),
             )
@@ -378,6 +460,34 @@ impl MobEntity {
     fn apply_sun_burn(&self) {
         let entity = &self.living_entity.entity;
         entity.set_on_fire_for(8.0);
+    }
+}
+
+fn write_no_ai_nbt(nbt: &mut pumpkin_nbt::compound::NbtCompound, no_ai: bool) {
+    if no_ai {
+        nbt.put_bool("NoAI", true);
+    }
+}
+
+fn read_no_ai_nbt(nbt: &pumpkin_nbt::compound::NbtCompound) -> bool {
+    nbt.get_bool("NoAI").unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use pumpkin_nbt::compound::NbtCompound;
+
+    use super::{read_no_ai_nbt, write_no_ai_nbt};
+
+    #[test]
+    fn no_ai_nbt_round_trip() {
+        let mut nbt = NbtCompound::new();
+
+        write_no_ai_nbt(&mut nbt, true);
+        assert!(read_no_ai_nbt(&nbt));
+
+        let empty_nbt = NbtCompound::new();
+        assert!(!read_no_ai_nbt(&empty_nbt));
     }
 }
 
@@ -539,57 +649,69 @@ impl<T: Mob + Send + 'static> EntityBase for T {
             }
 
             self.mob_tick(caller).await;
+            mob_entity.tick_ambient_sound();
 
-            let age = mob_entity.living_entity.entity.age.load(Relaxed);
-            let entity_id = mob_entity.living_entity.entity.entity_id;
-
-            // 1. "Take" selectors out of the mutexes
-            let mut target_selector = {
-                let mut guard = mob_entity.target_selector.lock().unwrap();
-                std::mem::take(&mut *guard)
-            };
-            let mut goals_selector = {
-                let mut guard = mob_entity.goals_selector.lock().unwrap();
-                std::mem::take(&mut *guard)
-            };
-
-            // 2. Perform AI logic (No locks held, so .await is safe!)
-            if (age + entity_id) % 2 != 0 && age > 1 {
-                target_selector.tick_goals(self, false).await;
-                goals_selector.tick_goals(self, false).await;
+            if mob_entity.is_no_ai() {
+                // Vanilla keeps normal living/entity ticking active for NoAI mobs,
+                // but freezes goal execution and autonomous movement.
+                mob_entity.navigator.lock().unwrap().stop();
+                mob_entity
+                    .living_entity
+                    .movement_input
+                    .store(Vector3::default());
+                mob_entity.living_entity.jumping.store(false, Relaxed);
             } else {
-                target_selector.tick(self).await;
-                goals_selector.tick(self).await;
+                let age = mob_entity.living_entity.entity.age.load(Relaxed);
+                let entity_id = mob_entity.living_entity.entity.entity_id;
+
+                // 1. "Take" selectors out of the mutexes
+                let mut target_selector = {
+                    let mut guard = mob_entity.target_selector.lock().unwrap();
+                    std::mem::take(&mut *guard)
+                };
+                let mut goals_selector = {
+                    let mut guard = mob_entity.goals_selector.lock().unwrap();
+                    std::mem::take(&mut *guard)
+                };
+
+                // 2. Perform AI logic (No locks held, so .await is safe!)
+                if (age + entity_id) % 2 != 0 && age > 1 {
+                    target_selector.tick_goals(self, false).await;
+                    goals_selector.tick_goals(self, false).await;
+                } else {
+                    target_selector.tick(self).await;
+                    goals_selector.tick(self).await;
+                }
+
+                // 3. "Put back" selectors
+                {
+                    *mob_entity.target_selector.lock().unwrap() = target_selector;
+                    *mob_entity.goals_selector.lock().unwrap() = goals_selector;
+                };
+
+                // 4. Repeat for Navigator
+                let mut navigator = {
+                    let mut guard = mob_entity.navigator.lock().unwrap();
+                    std::mem::take(&mut *guard)
+                };
+
+                navigator.tick(&mob_entity.living_entity).await;
+
+                {
+                    *mob_entity.navigator.lock().unwrap() = navigator;
+                };
+
+                // Controllers are synchronous, so we can just use normal blocks
+                {
+                    let mut look_control = mob_entity.look_control.lock().unwrap();
+                    look_control.tick(self);
+                };
+
+                {
+                    let mut move_control = mob_entity.move_control.lock().unwrap();
+                    move_control.tick(self);
+                };
             }
-
-            // 3. "Put back" selectors
-            {
-                *mob_entity.target_selector.lock().unwrap() = target_selector;
-                *mob_entity.goals_selector.lock().unwrap() = goals_selector;
-            };
-
-            // 4. Repeat for Navigator
-            let mut navigator = {
-                let mut guard = mob_entity.navigator.lock().unwrap();
-                std::mem::take(&mut *guard)
-            };
-
-            navigator.tick(&mob_entity.living_entity).await;
-
-            {
-                *mob_entity.navigator.lock().unwrap() = navigator;
-            };
-
-            // Controllers are synchronous, so we can just use normal blocks
-            {
-                let mut look_control = mob_entity.look_control.lock().unwrap();
-                look_control.tick(self);
-            };
-
-            {
-                let mut move_control = mob_entity.move_control.lock().unwrap();
-                move_control.tick(self);
-            };
 
             mob_entity.living_entity.tick(caller, server).await;
             self.post_tick().await;
@@ -686,6 +808,10 @@ impl<T: Mob + Send + 'static> EntityBase for T {
 
     fn get_living_entity(&self) -> Option<&LivingEntity> {
         Some(&self.get_mob_entity().living_entity)
+    }
+
+    fn get_mob(&self) -> Option<&MobEntity> {
+        Some(Mob::get_mob_entity(self))
     }
 
     fn cast_any(&self) -> &dyn std::any::Any {

@@ -1,5 +1,21 @@
 <div align="center">
 
+## wip/fixes fork
+
+This fork includes some fixes that attempt to bring some Minecraft Java behaviors into Pumpkin:
+- Improved mob pathing (able to navigate & keep navigation while player is mid-air or close to pathable ground)
+- Accurate sound positioning
+- Mob ambient & hit sounds
+- Player able to take damage from arrows
+- Skeletons able to strafe at a reasonable speed
+- Mob knockback is more reasonable
+- Arrow knockback direction and magnitude is more reasonable
+
+I am creating pull requests for the components that are easily testable to be 1:1 with Minecraft Java behavior.
+However, some components like mob pathing, arrow knockback, and mob movement are not 1:1 with Minecraft Java behavior, so I will not upstream these changes. I will attempt to create issues for these.
+
+AI Disclaimer: AI was used to help create the fixes. I confirmed each fix by playtesting.
+
 # Pumpkin
 
 ![CI](https://github.com/Pumpkin-MC/Pumpkin/actions/workflows/rust.yml/badge.svg)
